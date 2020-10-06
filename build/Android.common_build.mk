@@ -30,7 +30,7 @@ include art/build/Android.common.mk
 #
 ART_BUILD_TARGET_NDEBUG ?= true
 ART_BUILD_TARGET_DEBUG ?= false
-ART_BUILD_HOST_NDEBUG ?= true
+ART_BUILD_HOST_NDEBUG ?= false
 ART_BUILD_HOST_DEBUG ?= false
 
 ifeq ($(USE_DEX2OAT_DEBUG),true)
