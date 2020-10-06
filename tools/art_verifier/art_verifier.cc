@@ -223,7 +223,7 @@ struct MethodVerifierMain : public CmdlineMain<MethodVerifierArgs> {
       gLogVerbosity.verifier = true;
     }
     if (args_->method_verifier_verbose_debug_) {
-      gLogVerbosity.verifier_debug = true;
+      gLogVerbosity.verifier_debug = false;
     }
 
     const size_t verifier_reps = std::max(static_cast<size_t>(1u), args_->repetitions_);
