@@ -94,14 +94,12 @@ ObjPtr<mirror::Class> Class::GetPrimitiveClass(ObjPtr<mirror::String> name) {
   }
 }
 
-ObjPtr<ClassExt> Class::EnsureExtDataPresent(Thread* self) {
-  ObjPtr<ClassExt> existing(GetExtData());
+ObjPtr<ClassExt> Class::EnsureExtDataPresent(Handle<Class> h_this, Thread* self) {
+  ObjPtr<ClassExt> existing(h_this->GetExtData());
   if (!existing.IsNull()) {
     return existing;
   }
-  StackHandleScope<3> hs(self);
-  // Handlerize 'this' since we are allocating here.
-  Handle<Class> h_this(hs.NewHandle(this));
+  StackHandleScope<2> hs(self);
   // Clear exception so we can allocate.
   Handle<Throwable> throwable(hs.NewHandle(self->GetException()));
   self->ClearException();
@@ -152,7 +150,11 @@ void Class::SetStatus(Handle<Class> h_this, ClassStatus new_status, Thread* self
       LOG(FATAL) << "Unexpected change back of class status for " << h_this->PrettyClass()
                  << " " << old_status << " -> " << new_status;
     }
-    if (new_status >= ClassStatus::kResolved || old_status >= ClassStatus::kResolved) {
+    if (old_status == ClassStatus::kInitialized) {
+      // We do not hold the lock for making the class visibly initialized
+      // as this is unnecessary and could lead to deadlocks.
+      CHECK_EQ(new_status, ClassStatus::kVisiblyInitialized);
+    } else if (new_status >= ClassStatus::kResolved || old_status >= ClassStatus::kResolved) {
       // When classes are being resolved the resolution code should hold the lock.
       CHECK_EQ(h_this->GetLockOwnerThreadId(), self->GetThreadId())
             << "Attempt to change status of class while not holding its lock: "
@@ -172,7 +174,7 @@ void Class::SetStatus(Handle<Class> h_this, ClassStatus new_status, Thread* self
       }
     }
 
-    ObjPtr<ClassExt> ext(h_this->EnsureExtDataPresent(self));
+    ObjPtr<ClassExt> ext(EnsureExtDataPresent(h_this, self));
     if (!ext.IsNull()) {
       self->AssertPendingException();
       ext->SetVerifyError(self->GetException());
@@ -200,7 +202,7 @@ void Class::SetStatus(Handle<Class> h_this, ClassStatus new_status, Thread* self
   // Setting the object size alloc fast path needs to be after the status write so that if the
   // alloc path sees a valid object size, we would know that it's initialized as long as it has a
   // load-acquire/fake dependency.
-  if (new_status == ClassStatus::kInitialized && !h_this->IsVariableSize()) {
+  if (new_status == ClassStatus::kVisiblyInitialized && !h_this->IsVariableSize()) {
     DCHECK_EQ(h_this->GetObjectSizeAllocFastPath(), std::numeric_limits<uint32_t>::max());
     // Finalizable objects must always go slow path.
     if (!h_this->IsFinalizable()) {
@@ -226,6 +228,10 @@ void Class::SetStatus(Handle<Class> h_this, ClassStatus new_status, Thread* self
       if (new_status == ClassStatus::kRetired || new_status == ClassStatus::kErrorUnresolved) {
         h_this->NotifyAll(self);
       }
+    } else if (old_status == ClassStatus::kInitialized) {
+      // Do not notify for transition from kInitialized to ClassStatus::kVisiblyInitialized.
+      // This is a hidden transition, not observable by bytecode.
+      DCHECK_EQ(new_status, ClassStatus::kVisiblyInitialized);  // Already CHECK()ed above.
     } else {
       CHECK_NE(new_status, ClassStatus::kRetired);
       if (old_status >= ClassStatus::kResolved || new_status >= ClassStatus::kResolved) {
@@ -233,6 +239,38 @@ void Class::SetStatus(Handle<Class> h_this, ClassStatus new_status, Thread* self
       }
     }
   }
+}
+
+void Class::SetStatusForPrimitiveOrArray(ClassStatus new_status) {
+  DCHECK(IsPrimitive<kVerifyNone>() || IsArrayClass<kVerifyNone>());
+  DCHECK(!IsErroneous(new_status));
+  DCHECK(!IsErroneous(GetStatus<kVerifyNone>()));
+  DCHECK_GT(new_status, GetStatus<kVerifyNone>());
+
+  if (kBitstringSubtypeCheckEnabled) {
+    LOG(FATAL) << "Unimplemented";
+  }
+  // The ClassStatus is always in the 4 most-significant bits of status_.
+  static_assert(sizeof(status_) == sizeof(uint32_t), "Size of status_ not equal to uint32");
+  uint32_t new_status_value = static_cast<uint32_t>(new_status) << (32 - kClassStatusBitSize);
+  // Use normal store. For primitives and core arrays classes (Object[],
+  // Class[], String[] and primitive arrays), the status is set while the
+  // process is still single threaded. For other arrays classes, it is set
+  // in a pre-fence visitor which initializes all fields and the subsequent
+  // fence together with address dependency shall ensure memory visibility.
+  SetField32</*kTransactionActive=*/ false,
+             /*kCheckTransaction=*/ false,
+             kVerifyNone>(StatusOffset(), new_status_value);
+
+  // Do not update `object_alloc_fast_path_`. Arrays are variable size and
+  // instances of primitive classes cannot be created at all.
+
+  if (kIsDebugBuild && new_status >= ClassStatus::kInitialized) {
+    CHECK(WasVerificationAttempted()) << PrettyClassAndClassLoader();
+  }
+
+  // There can be no waiters to notify as these classes are initialized
+  // before another thread can see them.
 }
 
 void Class::SetDexCache(ObjPtr<DexCache> new_dex_cache) {
@@ -1205,12 +1243,13 @@ class CopyClassVisitor {
   DISALLOW_COPY_AND_ASSIGN(CopyClassVisitor);
 };
 
-ObjPtr<Class> Class::CopyOf(
-    Thread* self, int32_t new_length, ImTable* imt, PointerSize pointer_size) {
+ObjPtr<Class> Class::CopyOf(Handle<Class> h_this,
+                            Thread* self,
+                            int32_t new_length,
+                            ImTable* imt,
+                            PointerSize pointer_size) {
   DCHECK_GE(new_length, static_cast<int32_t>(sizeof(Class)));
   // We may get copied by a compacting GC.
-  StackHandleScope<1> hs(self);
-  Handle<Class> h_this(hs.NewHandle(this));
   Runtime* runtime = Runtime::Current();
   gc::Heap* heap = runtime->GetHeap();
   // The num_bytes (3rd param) is sizeof(Class) as opposed to SizeOf()
@@ -1218,8 +1257,8 @@ ObjPtr<Class> Class::CopyOf(
   CopyClassVisitor visitor(self, &h_this, new_length, sizeof(Class), imt, pointer_size);
   ObjPtr<mirror::Class> java_lang_Class = GetClassRoot<mirror::Class>(runtime->GetClassLinker());
   ObjPtr<Object> new_class = kMovingClasses ?
-      heap->AllocObject<true>(self, java_lang_Class, new_length, visitor) :
-      heap->AllocNonMovableObject<true>(self, java_lang_Class, new_length, visitor);
+      heap->AllocObject(self, java_lang_Class, new_length, visitor) :
+      heap->AllocNonMovableObject(self, java_lang_Class, new_length, visitor);
   if (UNLIKELY(new_class == nullptr)) {
     self->AssertPendingOOMException();
     return nullptr;

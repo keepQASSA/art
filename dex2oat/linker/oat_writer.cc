@@ -1812,6 +1812,12 @@ class OatWriter::WriteCodeMethodVisitor : public OrderedMethodVisitor {
                                                                    target_offset);
               break;
             }
+            case LinkerPatch::Type::kCallEntrypoint: {
+              writer_->relative_patcher_->PatchEntrypointCall(&patched_code_,
+                                                              patch,
+                                                              offset_ + literal_offset);
+              break;
+            }
             case LinkerPatch::Type::kBakerReadBarrierBranch: {
               writer_->relative_patcher_->PatchBakerReadBarrierBranch(&patched_code_,
                                                                       patch,
@@ -2454,7 +2460,7 @@ class OatWriter::WriteQuickeningInfoMethodVisitor {
     return written_bytes_;
   }
 
-  SafeMap<const DexFile*, std::vector<uint32_t>>& GetQuickenInfoOffsetIndicies() {
+  SafeMap<const DexFile*, std::vector<uint32_t>>& GetQuickenInfoOffsetIndices() {
     return quicken_info_offset_indices_;
   }
 
@@ -2565,7 +2571,7 @@ bool OatWriter::WriteQuickeningInfo(OutputStream* vdex_out) {
     WriteQuickeningInfoOffsetsMethodVisitor table_visitor(
         vdex_out,
         quicken_info_offset,
-        &write_quicken_info_visitor.GetQuickenInfoOffsetIndicies(),
+        &write_quicken_info_visitor.GetQuickenInfoOffsetIndices(),
         /*out*/ &table_offsets);
     if (!table_visitor.VisitDexMethods(*dex_files_)) {
       PLOG(ERROR) << "Failed to write the vdex quickening info. File: "

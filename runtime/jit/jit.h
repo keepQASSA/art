@@ -117,10 +117,6 @@ class JitOptions {
     profile_saver_options_.SetWaitForJitNotificationsToSave(value);
   }
 
-  void SetProfileAOTCode(bool value) {
-    profile_saver_options_.SetProfileAOTCode(value);
-  }
-
   void SetJitAtFirstUse() {
     use_jit_compilation_ = true;
     compile_threshold_ = 0;
@@ -170,7 +166,7 @@ class Jit {
   // Create JIT itself.
   static Jit* Create(JitCodeCache* code_cache, JitOptions* options);
 
-  bool CompileMethod(ArtMethod* method, Thread* self, bool baseline, bool osr)
+  bool CompileMethod(ArtMethod* method, Thread* self, bool baseline, bool osr, bool prejit)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   const JitCodeCache* GetCodeCache() const {
@@ -194,6 +190,10 @@ class Jit {
   void AddMemoryUsage(ArtMethod* method, size_t bytes)
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
+
+  int GetThreadPoolPthreadPriority() const {
+    return options_->GetThreadPoolPthreadPriority();
+  }
 
   uint16_t OSRMethodThreshold() const {
     return options_->GetOsrThreshold();

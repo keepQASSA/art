@@ -127,6 +127,10 @@ static constexpr bool kUseThreadLocalAllocationStack = true;
 
 class Heap {
  public:
+  // How much we grow the TLAB if we can do it.
+  static constexpr size_t kPartialTlabSize = 16 * KB;
+  static constexpr bool kUsePartialTlabs = true;
+
   static constexpr size_t kDefaultStartingSize = kPageSize;
   static constexpr size_t kDefaultInitialSize = 2 * MB;
   static constexpr size_t kDefaultMaximumSize = 256 * MB;
@@ -222,7 +226,7 @@ class Heap {
   ~Heap();
 
   // Allocates and initializes storage for an object instance.
-  template <bool kInstrumented, typename PreFenceVisitor>
+  template <bool kInstrumented = true, typename PreFenceVisitor>
   mirror::Object* AllocObject(Thread* self,
                               ObjPtr<mirror::Class> klass,
                               size_t num_bytes,
@@ -232,14 +236,14 @@ class Heap {
                !*pending_task_lock_,
                !*backtrace_lock_,
                !Roles::uninterruptible_) {
-    return AllocObjectWithAllocator<kInstrumented, true>(self,
-                                                         klass,
-                                                         num_bytes,
-                                                         GetCurrentAllocator(),
-                                                         pre_fence_visitor);
+    return AllocObjectWithAllocator<kInstrumented>(self,
+                                                   klass,
+                                                   num_bytes,
+                                                   GetCurrentAllocator(),
+                                                   pre_fence_visitor);
   }
 
-  template <bool kInstrumented, typename PreFenceVisitor>
+  template <bool kInstrumented = true, typename PreFenceVisitor>
   mirror::Object* AllocNonMovableObject(Thread* self,
                                         ObjPtr<mirror::Class> klass,
                                         size_t num_bytes,
@@ -249,14 +253,14 @@ class Heap {
                !*pending_task_lock_,
                !*backtrace_lock_,
                !Roles::uninterruptible_) {
-    return AllocObjectWithAllocator<kInstrumented, true>(self,
-                                                         klass,
-                                                         num_bytes,
-                                                         GetCurrentNonMovingAllocator(),
-                                                         pre_fence_visitor);
+    return AllocObjectWithAllocator<kInstrumented>(self,
+                                                   klass,
+                                                   num_bytes,
+                                                   GetCurrentNonMovingAllocator(),
+                                                   pre_fence_visitor);
   }
 
-  template <bool kInstrumented, bool kCheckLargeObject, typename PreFenceVisitor>
+  template <bool kInstrumented = true, bool kCheckLargeObject = true, typename PreFenceVisitor>
   ALWAYS_INLINE mirror::Object* AllocObjectWithAllocator(Thread* self,
                                                          ObjPtr<mirror::Class> klass,
                                                          size_t byte_count,

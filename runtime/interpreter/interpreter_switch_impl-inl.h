@@ -353,7 +353,7 @@ class InstructionHandler {
     // We don't send method-exit if it's a pop-frame. We still send frame_popped though.
     if (UNLIKELY(instrumentation->HasMethodExitListeners() && !frame.GetForcePopFrame())) {
       had_event = true;
-      instrumentation->MethodExitEvent(self, thiz.Ptr(), method, dex_pc, result);
+      instrumentation->MethodExitEvent(self, thiz, method, dex_pc, result);
     }
     if (UNLIKELY(frame.NeedsNotifyPop() && instrumentation->HasWatchedFramePopListeners())) {
       had_event = true;
@@ -836,14 +836,11 @@ class InstructionHandler {
                                                      false,
                                                      do_access_check);
     if (LIKELY(c != nullptr)) {
+      gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
       if (UNLIKELY(c->IsStringClass())) {
-        gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
-        obj = mirror::String::AllocEmptyString<true>(self, allocator_type);
+        obj = mirror::String::AllocEmptyString(self, allocator_type);
       } else {
-        obj = AllocObjectFromCode<true>(
-            c.Ptr(),
-            self,
-            Runtime::Current()->GetHeap()->GetCurrentAllocator());
+        obj = AllocObjectFromCode(c, self, allocator_type);
       }
     }
     if (UNLIKELY(obj == nullptr)) {
@@ -864,7 +861,7 @@ class InstructionHandler {
 
   ALWAYS_INLINE void NEW_ARRAY() REQUIRES_SHARED(Locks::mutator_lock_) {
     int32_t length = shadow_frame.GetVReg(inst->VRegB_22c(inst_data));
-    ObjPtr<mirror::Object> obj = AllocArrayFromCode<do_access_check, true>(
+    ObjPtr<mirror::Object> obj = AllocArrayFromCode<do_access_check>(
         dex::TypeIndex(inst->VRegC_22c()),
         length,
         shadow_frame.GetMethod(),
@@ -2626,11 +2623,6 @@ ATTRIBUTE_NO_SANITIZE_ADDRESS void ExecuteSwitchImplCpp(SwitchImplContext* ctx) 
   Thread* self = ctx->self;
   const CodeItemDataAccessor& accessor = ctx->accessor;
   ShadowFrame& shadow_frame = ctx->shadow_frame;
-  if (UNLIKELY(!shadow_frame.HasReferenceArray())) {
-    LOG(FATAL) << "Invalid shadow frame for interpreter use";
-    ctx->result = JValue();
-    return;
-  }
   self->VerifyStack();
 
   uint32_t dex_pc = shadow_frame.GetDexPC();

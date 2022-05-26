@@ -343,7 +343,7 @@ class QuickArgumentVisitor {
     uintptr_t outer_pc_offset = current_code->NativeQuickPcOffset(outer_pc);
 
     if (current_code->IsOptimized()) {
-      CodeInfo code_info(current_code, CodeInfo::DecodeFlags::InlineInfoOnly);
+      CodeInfo code_info = CodeInfo::DecodeInlineInfoOnly(current_code);
       StackMap stack_map = code_info.GetStackMapForNativePcOffset(outer_pc_offset);
       DCHECK(stack_map.IsValid());
       BitTableRange<InlineInfo> inline_infos = code_info.GetInlineInfosOf(stack_map);
@@ -769,22 +769,22 @@ extern "C" uint64_t artQuickToInterpreterBridge(ArtMethod* method, Thread* self,
     BuildQuickShadowFrameVisitor shadow_frame_builder(sp, method->IsStatic(), shorty, shorty_len,
                                                       shadow_frame, first_arg_reg);
     shadow_frame_builder.VisitArguments();
-    const bool needs_initialization =
-        method->IsStatic() && !method->GetDeclaringClass()->IsInitialized();
     // Push a transition back into managed code onto the linked list in thread.
     self->PushManagedStackFragment(&fragment);
     self->PushShadowFrame(shadow_frame);
     self->EndAssertNoThreadSuspension(old_cause);
 
-    if (needs_initialization) {
-      // Ensure static method's class is initialized.
-      StackHandleScope<1> hs(self);
-      Handle<mirror::Class> h_class(hs.NewHandle(shadow_frame->GetMethod()->GetDeclaringClass()));
-      if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(self, h_class, true, true)) {
-        DCHECK(Thread::Current()->IsExceptionPending())
-            << shadow_frame->GetMethod()->PrettyMethod();
-        self->PopManagedStackFragment(fragment);
-        return 0;
+    if (method->IsStatic()) {
+      ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
+      if (UNLIKELY(!declaring_class->IsVisiblyInitialized())) {
+        // Ensure static method's class is initialized.
+        StackHandleScope<1> hs(self);
+        Handle<mirror::Class> h_class(hs.NewHandle(declaring_class));
+        if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(self, h_class, true, true)) {
+          DCHECK(Thread::Current()->IsExceptionPending()) << method->PrettyMethod();
+          self->PopManagedStackFragment(fragment);
+          return 0;
+        }
       }
     }
 
@@ -941,12 +941,12 @@ extern "C" uint64_t artQuickProxyInvokeHandler(
   instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
   if (instr->HasMethodEntryListeners()) {
     instr->MethodEnterEvent(soa.Self(),
-                            soa.Decode<mirror::Object>(rcvr_jobj).Ptr(),
+                            soa.Decode<mirror::Object>(rcvr_jobj),
                             proxy_method,
                             0);
     if (soa.Self()->IsExceptionPending()) {
       instr->MethodUnwindEvent(self,
-                               soa.Decode<mirror::Object>(rcvr_jobj).Ptr(),
+                               soa.Decode<mirror::Object>(rcvr_jobj),
                                proxy_method,
                                0);
       return 0;
@@ -956,13 +956,13 @@ extern "C" uint64_t artQuickProxyInvokeHandler(
   if (soa.Self()->IsExceptionPending()) {
     if (instr->HasMethodUnwindListeners()) {
       instr->MethodUnwindEvent(self,
-                               soa.Decode<mirror::Object>(rcvr_jobj).Ptr(),
+                               soa.Decode<mirror::Object>(rcvr_jobj),
                                proxy_method,
                                0);
     }
   } else if (instr->HasMethodExitListeners()) {
     instr->MethodExitEvent(self,
-                           soa.Decode<mirror::Object>(rcvr_jobj).Ptr(),
+                           soa.Decode<mirror::Object>(rcvr_jobj),
                            proxy_method,
                            0,
                            result);
@@ -2302,11 +2302,7 @@ void BuildGenericJniFrameVisitor::FinalizeHandleScope(Thread* self) {
   }
 }
 
-#if defined(__arm__) || defined(__aarch64__)
-extern "C" const void* artFindNativeMethod();
-#else
 extern "C" const void* artFindNativeMethod(Thread* self);
-#endif
 
 static uint64_t artQuickGenericJniEndJNIRef(Thread* self,
                                             uint32_t cookie,
@@ -2421,11 +2417,7 @@ extern "C" TwoWordReturn artQuickGenericJniTrampoline(Thread* self, ArtMethod** 
   // pointer.
   DCHECK(nativeCode != nullptr);
   if (nativeCode == GetJniDlsymLookupStub()) {
-#if defined(__arm__) || defined(__aarch64__)
-    nativeCode = artFindNativeMethod();
-#else
     nativeCode = artFindNativeMethod(self);
-#endif
 
     if (nativeCode == nullptr) {
       DCHECK(self->IsExceptionPending());    // There should be an exception pending now.
@@ -2684,6 +2676,11 @@ extern "C" TwoWordReturn artInvokeInterfaceTrampoline(ArtMethod* interface_metho
       return GetTwoWordFailureValue();  // Failure.
     }
   }
+
+  // The compiler and interpreter make sure the conflict trampoline is never
+  // called on a method that resolves to j.l.Object.
+  CHECK(!interface_method->GetDeclaringClass()->IsObjectClass());
+  CHECK(interface_method->GetDeclaringClass()->IsInterface());
 
   DCHECK(!interface_method->IsRuntimeMethod());
   // Look whether we have a match in the ImtConflictTable.

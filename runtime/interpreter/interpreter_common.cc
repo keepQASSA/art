@@ -81,7 +81,7 @@ bool UseFastInterpreterToInterpreterInvoke(ArtMethod* method) {
   if (method->GetDeclaringClass()->IsStringClass() && method->IsConstructor()) {
     return false;
   }
-  if (method->IsStatic() && !method->GetDeclaringClass()->IsInitialized()) {
+  if (method->IsStatic() && !method->GetDeclaringClass()->IsVisiblyInitialized()) {
     return false;
   }
   ProfilingInfo* profiling_info = method->GetProfilingInfo(kRuntimePointerSize);
@@ -217,7 +217,7 @@ bool DoIGetQuick(ShadowFrame& shadow_frame, const Instruction* inst, uint16_t in
     // Save obj in case the instrumentation event has thread suspension.
     HandleWrapperObjPtr<mirror::Object> h = hs.NewHandleWrapper(&obj);
     instrumentation->FieldReadEvent(self,
-                                    obj.Ptr(),
+                                    obj,
                                     shadow_frame.GetMethod(),
                                     shadow_frame.GetDexPC(),
                                     f);
@@ -405,7 +405,7 @@ bool DoIPutQuick(const ShadowFrame& shadow_frame, const Instruction* inst, uint1
     HandleWrapper<mirror::Object> ret(hs.NewHandleWrapper<mirror::Object>(
         field_type == Primitive::kPrimNot ? field_value.GetGCRoot() : &fake_root));
     instrumentation->FieldWriteEvent(self,
-                                     obj.Ptr(),
+                                     obj,
                                      shadow_frame.GetMethod(),
                                      shadow_frame.GetDexPC(),
                                      f,
@@ -585,18 +585,18 @@ void ArtInterpreterToCompiledCodeBridge(Thread* self,
   // Ensure static methods are initialized.
   if (method->IsStatic()) {
     ObjPtr<mirror::Class> declaringClass = method->GetDeclaringClass();
-    if (UNLIKELY(!declaringClass->IsInitialized())) {
+    if (UNLIKELY(!declaringClass->IsVisiblyInitialized())) {
       self->PushShadowFrame(shadow_frame);
       StackHandleScope<1> hs(self);
       Handle<mirror::Class> h_class(hs.NewHandle(declaringClass));
-      if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(self, h_class, true,
-                                                                            true))) {
+      if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(
+                        self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true))) {
         self->PopShadowFrame();
         DCHECK(self->IsExceptionPending());
         return;
       }
       self->PopShadowFrame();
-      CHECK(h_class->IsInitializing());
+      DCHECK(h_class->IsInitializing());
       // Reload from shadow frame in case the method moved, this is faster than adding a handle.
       method = shadow_frame->GetMethod();
     }
@@ -886,7 +886,7 @@ bool DoInvokePolymorphic(Thread* self,
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   ArtMethod* invoke_method =
       class_linker->ResolveMethod<ClassLinker::ResolveMode::kCheckICCEAndIAE>(
-          self, invoke_method_idx, shadow_frame.GetMethod(), kVirtual);
+          self, invoke_method_idx, shadow_frame.GetMethod(), kPolymorphic);
 
   // Ensure intrinsic identifiers are initialized.
   DCHECK(invoke_method->IsIntrinsic());
@@ -1799,7 +1799,7 @@ bool DoFilledNewArray(const Instruction* inst,
     }
     return false;
   }
-  ObjPtr<mirror::Object> new_array = mirror::Array::Alloc<true>(
+  ObjPtr<mirror::Object> new_array = mirror::Array::Alloc(
       self,
       array_class,
       length,

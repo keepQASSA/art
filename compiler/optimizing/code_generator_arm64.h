@@ -331,6 +331,16 @@ class InstructionCodeGeneratorARM64 : public InstructionCodeGenerator {
                              vixl::aarch64::Label* false_target);
   void DivRemOneOrMinusOne(HBinaryOperation* instruction);
   void DivRemByPowerOfTwo(HBinaryOperation* instruction);
+  void GenerateIncrementNegativeByOne(vixl::aarch64::Register out,
+                                      vixl::aarch64::Register in, bool use_cond_inc);
+  void GenerateResultRemWithAnyConstant(vixl::aarch64::Register out,
+                                        vixl::aarch64::Register dividend,
+                                        vixl::aarch64::Register quotient,
+                                        int64_t divisor,
+                                        // This function may acquire a scratch register.
+                                        vixl::aarch64::UseScratchRegisterScope* temps_scope);
+  void GenerateInt64DivRemWithAnyConstant(HBinaryOperation* instruction);
+  void GenerateInt32DivRemWithAnyConstant(HBinaryOperation* instruction);
   void GenerateDivRemWithAnyConstant(HBinaryOperation* instruction);
   void GenerateIntDiv(HDiv* instruction);
   void GenerateIntDivForConstDenom(HDiv *instruction);
@@ -435,10 +445,14 @@ class CodeGeneratorARM64 : public CodeGenerator {
     return kArm64WordSize;
   }
 
-  size_t GetFloatingPointSpillSlotSize() const override {
+  size_t GetSlowPathFPWidth() const override {
     return GetGraph()->HasSIMD()
-        ? 2 * kArm64WordSize   // 16 bytes == 2 arm64 words for each spill
-        : 1 * kArm64WordSize;  //  8 bytes == 1 arm64 words for each spill
+        ? vixl::aarch64::kQRegSizeInBytes
+        : vixl::aarch64::kDRegSizeInBytes;
+  }
+
+  size_t GetCalleePreservedFPWidth() const override {
+    return vixl::aarch64::kDRegSizeInBytes;
   }
 
   uintptr_t GetAddressOf(HBasicBlock* block) override {
@@ -629,6 +643,9 @@ class CodeGeneratorARM64 : public CodeGenerator {
                                                dex::StringIndex string_index,
                                                vixl::aarch64::Label* adrp_label = nullptr);
 
+  // Emit the BL instruction for entrypoint thunk call and record the associated patch for AOT.
+  void EmitEntrypointThunkCall(ThreadOffset64 entrypoint_offset);
+
   // Emit the CBNZ instruction for baker read barrier and record
   // the associated patch for AOT or slow path for JIT.
   void EmitBakerReadBarrierCbnz(uint32_t custom_data);
@@ -770,6 +787,15 @@ class CodeGeneratorARM64 : public CodeGenerator {
   void GenerateImplicitNullCheck(HNullCheck* instruction) override;
   void GenerateExplicitNullCheck(HNullCheck* instruction) override;
 
+  void MaybeRecordImplicitNullCheck(HInstruction* instr) final {
+    // The function must be only called within special scopes
+    // (EmissionCheckScope, ExactAssemblyScope) which prevent generation of
+    // veneer/literal pools by VIXL assembler.
+    CHECK_EQ(GetVIXLAssembler()->ArePoolsBlocked(), true)
+        << "The function must only be called within EmissionCheckScope or ExactAssemblyScope";
+    CodeGenerator::MaybeRecordImplicitNullCheck(instr);
+  }
+
  private:
   // Encoding of thunk type and data for link-time generated thunks for Baker read barriers.
 
@@ -887,10 +913,6 @@ class CodeGeneratorARM64 : public CodeGenerator {
   ParallelMoveResolverARM64 move_resolver_;
   Arm64Assembler assembler_;
 
-  // Deduplication map for 32-bit literals, used for non-patchable boot image addresses.
-  Uint32ToLiteralMap uint32_literals_;
-  // Deduplication map for 64-bit literals, used for non-patchable method address or method code.
-  Uint64ToLiteralMap uint64_literals_;
   // PC-relative method patch info for kBootImageLinkTimePcRelative/BootImageRelRo.
   // Also used for type/string patches for kBootImageRelRo (same linker patch as for methods).
   ArenaDeque<PcRelativePatchInfo> boot_image_method_patches_;
@@ -906,9 +928,15 @@ class CodeGeneratorARM64 : public CodeGenerator {
   ArenaDeque<PcRelativePatchInfo> string_bss_entry_patches_;
   // PC-relative patch info for IntrinsicObjects.
   ArenaDeque<PcRelativePatchInfo> boot_image_intrinsic_patches_;
+  // Patch info for calls to entrypoint dispatch thunks. Used for slow paths.
+  ArenaDeque<PatchInfo<vixl::aarch64::Label>> call_entrypoint_patches_;
   // Baker read barrier patch info.
   ArenaDeque<BakerReadBarrierPatchInfo> baker_read_barrier_patches_;
 
+  // Deduplication map for 32-bit literals, used for JIT for boot image addresses.
+  Uint32ToLiteralMap uint32_literals_;
+  // Deduplication map for 64-bit literals, used for JIT for method address or method code.
+  Uint64ToLiteralMap uint64_literals_;
   // Patches for string literals in JIT compiled code.
   StringToLiteralMap jit_string_patches_;
   // Patches for class literals in JIT compiled code.

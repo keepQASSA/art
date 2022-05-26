@@ -281,9 +281,6 @@ NO_RETURN static void Usage(const char* fmt, ...) {
   UsageError("      Example: --image-format=lz4");
   UsageError("      Default: uncompressed");
   UsageError("");
-  UsageError("  --image-classes=<classname-file>: specifies classes to include in an image.");
-  UsageError("      Example: --image=frameworks/base/preloaded-classes");
-  UsageError("");
   UsageError("  --base=<hex-address>: specifies the base address when creating a boot image.");
   UsageError("      Example: --base=0x50000000");
   UsageError("");
@@ -706,8 +703,6 @@ class Dex2Oat final {
       dm_fd_(-1),
       zip_fd_(-1),
       image_base_(0U),
-      image_classes_zip_filename_(nullptr),
-      image_classes_filename_(nullptr),
       image_storage_mode_(ImageHeader::kStorageModeUncompressed),
       passes_to_run_filename_(nullptr),
       dirty_image_objects_filename_(nullptr),
@@ -882,18 +877,6 @@ class Dex2Oat final {
       boot_image_filename_ = parser_options->boot_image_filename;
     }
 
-    if (image_classes_filename_ != nullptr && !IsBootImage()) {
-      Usage("--image-classes should only be used with --image");
-    }
-
-    if (image_classes_filename_ != nullptr && !boot_image_filename_.empty()) {
-      Usage("--image-classes should not be used with --boot-image");
-    }
-
-    if (image_classes_zip_filename_ != nullptr && image_classes_filename_ == nullptr) {
-      Usage("--image-classes-zip should be used with --image-classes");
-    }
-
     if (dex_filenames_.empty() && zip_fd_ == -1) {
       Usage("Input must be supplied with either --dex-file or --zip-fd");
     }
@@ -932,13 +915,6 @@ class Dex2Oat final {
     const bool have_profile_fd = profile_file_fd_ != kInvalidFd;
     if (have_profile_file && have_profile_fd) {
       Usage("Profile file should not be specified with both --profile-file-fd and --profile-file");
-    }
-
-    if (have_profile_file || have_profile_fd) {
-      if (image_classes_filename_ != nullptr ||
-          image_classes_zip_filename_ != nullptr) {
-        Usage("Profile based image creation is not supported with image or compiled classes");
-      }
     }
 
     if (!parser_options->oat_symbols.empty()) {
@@ -1176,8 +1152,6 @@ class Dex2Oat final {
     AssignIfExists(args, M::Watchdog, &parser_options->watch_dog_enabled);
     AssignIfExists(args, M::WatchdogTimeout, &parser_options->watch_dog_timeout_in_ms);
     AssignIfExists(args, M::Threads, &thread_count_);
-    AssignIfExists(args, M::ImageClasses, &image_classes_filename_);
-    AssignIfExists(args, M::ImageClassesZip, &image_classes_zip_filename_);
     AssignIfExists(args, M::CpuSet, &cpu_set_);
     AssignIfExists(args, M::Passes, &passes_to_run_filename_);
     AssignIfExists(args, M::BootImage, &parser_options->boot_image_filename);
@@ -1509,8 +1483,6 @@ class Dex2Oat final {
           LOG(INFO) << "Image class " << s;
         }
       }
-      // Note: If we have a profile, classes previously loaded for the --image-classes
-      // option are overwritten here.
       compiler_options_->image_classes_.swap(image_classes);
     }
   }
@@ -1520,7 +1492,7 @@ class Dex2Oat final {
   dex2oat::ReturnCode Setup() {
     TimingLogger::ScopedTiming t("dex2oat Setup", timings_);
 
-    if (!PrepareImageClasses() || !PrepareDirtyObjects()) {
+    if (!PrepareDirtyObjects()) {
       return dex2oat::ReturnCode::kOther;
     }
 
@@ -1736,6 +1708,20 @@ class Dex2Oat final {
       }
     }
 
+    // Setup VerifierDeps for compilation and report if we fail to parse the data.
+    if (!DoEagerUnquickeningOfVdex() && input_vdex_file_ != nullptr) {
+      std::unique_ptr<verifier::VerifierDeps> verifier_deps(
+          new verifier::VerifierDeps(dex_files, /*output_only=*/ false));
+      if (!verifier_deps->ParseStoredData(dex_files, input_vdex_file_->GetVerifierDepsData())) {
+        return dex2oat::ReturnCode::kOther;
+      }
+      callbacks_->SetVerifierDeps(verifier_deps.release());
+    } else {
+      // Create the main VerifierDeps, here instead of in the compiler since we want to aggregate
+      // the results for all the dex files, not just the results for the current dex file.
+      callbacks_->SetVerifierDeps(new verifier::VerifierDeps(dex_files));
+    }
+
     return dex2oat::ReturnCode::kNoFailure;
   }
 
@@ -1845,6 +1831,9 @@ class Dex2Oat final {
                                      compiler_kind_,
                                      thread_count_,
                                      swap_fd_));
+
+    driver_->PrepareDexFilesForOatFile(timings_);
+
     if (!IsBootImage()) {
       driver_->SetClasspathDexFiles(class_loader_context_->FlattenOpenedDexFiles());
     }
@@ -1862,9 +1851,6 @@ class Dex2Oat final {
     // Setup vdex for compilation.
     const std::vector<const DexFile*>& dex_files = compiler_options_->dex_files_for_oat_file_;
     if (!DoEagerUnquickeningOfVdex() && input_vdex_file_ != nullptr) {
-      callbacks_->SetVerifierDeps(
-          new verifier::VerifierDeps(dex_files, input_vdex_file_->GetVerifierDepsData()));
-
       // TODO: we unquicken unconditionally, as we don't know
       // if the boot image has changed. How exactly we'll know is under
       // experimentation.
@@ -1874,10 +1860,6 @@ class Dex2Oat final {
       // optimization does not depend on the boot image (the optimization relies on not
       // having final fields in a class, which does not change for an app).
       input_vdex_file_->Unquicken(dex_files, /* decompile_return_instruction */ false);
-    } else {
-      // Create the main VerifierDeps, here instead of in the compiler since we want to aggregate
-      // the results for all the dex files, not just the results for the current dex file.
-      callbacks_->SetVerifierDeps(new verifier::VerifierDeps(dex_files));
     }
     // Invoke the compilation.
     if (compile_individually) {
@@ -2372,37 +2354,6 @@ class Dex2Oat final {
     return dex_files_size >= very_large_threshold_;
   }
 
-  bool PrepareImageClasses() {
-    // If --image-classes was specified, calculate the full list of classes to include in the image.
-    DCHECK(compiler_options_->image_classes_.empty());
-    if (image_classes_filename_ != nullptr) {
-      std::unique_ptr<HashSet<std::string>> image_classes =
-          ReadClasses(image_classes_zip_filename_, image_classes_filename_, "image");
-      if (image_classes == nullptr) {
-        return false;
-      }
-      compiler_options_->image_classes_.swap(*image_classes);
-    }
-    return true;
-  }
-
-  static std::unique_ptr<HashSet<std::string>> ReadClasses(const char* zip_filename,
-                                                           const char* classes_filename,
-                                                           const char* tag) {
-    std::unique_ptr<HashSet<std::string>> classes;
-    std::string error_msg;
-    if (zip_filename != nullptr) {
-      classes = ReadImageClassesFromZip(zip_filename, classes_filename, &error_msg);
-    } else {
-      classes = ReadImageClassesFromFile(classes_filename);
-    }
-    if (classes == nullptr) {
-      LOG(ERROR) << "Failed to create list of " << tag << " classes from '"
-                 << classes_filename << "': " << error_msg;
-    }
-    return classes;
-  }
-
   bool PrepareDirtyObjects() {
     if (dirty_image_objects_filename_ != nullptr) {
       dirty_image_objects_ = ReadCommentedInputFromFile<HashSet<std::string>>(
@@ -2650,25 +2601,6 @@ class Dex2Oat final {
     return true;
   }
 
-  // Reads the class names (java.lang.Object) and returns a set of descriptors (Ljava/lang/Object;)
-  static std::unique_ptr<HashSet<std::string>> ReadImageClassesFromFile(
-      const char* image_classes_filename) {
-    std::function<std::string(const char*)> process = DotToDescriptor;
-    return ReadCommentedInputFromFile<HashSet<std::string>>(image_classes_filename, &process);
-  }
-
-  // Reads the class names (java.lang.Object) and returns a set of descriptors (Ljava/lang/Object;)
-  static std::unique_ptr<HashSet<std::string>> ReadImageClassesFromZip(
-        const char* zip_filename,
-        const char* image_classes_filename,
-        std::string* error_msg) {
-    std::function<std::string(const char*)> process = DotToDescriptor;
-    return ReadCommentedInputFromZip<HashSet<std::string>>(zip_filename,
-                                                           image_classes_filename,
-                                                           &process,
-                                                           error_msg);
-  }
-
   // Read lines from the given file, dropping comments and empty lines. Post-process each line with
   // the given function.
   template <typename T>
@@ -2817,8 +2749,6 @@ class Dex2Oat final {
   std::vector<const char*> runtime_args_;
   std::vector<std::string> image_filenames_;
   uintptr_t image_base_;
-  const char* image_classes_zip_filename_;
-  const char* image_classes_filename_;
   ImageHeader::StorageMode image_storage_mode_;
   const char* passes_to_run_filename_;
   const char* dirty_image_objects_filename_;

@@ -1814,7 +1814,7 @@ size_t CodeGeneratorMIPS64::SaveFloatingPointRegister(size_t stack_index, uint32
                       FpuRegister(reg_id),
                       SP,
                       stack_index);
-  return GetFloatingPointSpillSlotSize();
+  return GetSlowPathFPWidth();
 }
 
 size_t CodeGeneratorMIPS64::RestoreFloatingPointRegister(size_t stack_index, uint32_t reg_id) {
@@ -1822,7 +1822,7 @@ size_t CodeGeneratorMIPS64::RestoreFloatingPointRegister(size_t stack_index, uin
                        FpuRegister(reg_id),
                        SP,
                        stack_index);
-  return GetFloatingPointSpillSlotSize();
+  return GetSlowPathFPWidth();
 }
 
 void CodeGeneratorMIPS64::DumpCoreRegister(std::ostream& stream, int reg) const {
@@ -7146,6 +7146,15 @@ void LocationsBuilderMIPS64::VisitStaticFieldSet(HStaticFieldSet* instruction) {
 
 void InstructionCodeGeneratorMIPS64::VisitStaticFieldSet(HStaticFieldSet* instruction) {
   HandleFieldSet(instruction, instruction->GetFieldInfo(), instruction->GetValueCanBeNull());
+}
+
+void LocationsBuilderMIPS64::VisitStringBuilderAppend(HStringBuilderAppend* instruction) {
+  codegen_->CreateStringBuilderAppendLocations(instruction, Location::RegisterLocation(V0));
+}
+
+void InstructionCodeGeneratorMIPS64::VisitStringBuilderAppend(HStringBuilderAppend* instruction) {
+  __ LoadConst32(A0, instruction->GetFormat()->GetValue());
+  codegen_->InvokeRuntime(kQuickStringBuilderAppend, instruction, instruction->GetDexPc());
 }
 
 void LocationsBuilderMIPS64::VisitUnresolvedInstanceFieldGet(

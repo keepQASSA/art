@@ -254,6 +254,7 @@ bool ImageWriter::PrepareImageAddressSpace(TimingLogger* timings) {
   }
 
   {
+    TimingLogger::ScopedTiming t("PreloadDexCaches", timings);
     // Preload deterministic contents to the dex cache arrays we're going to write.
     ScopedObjectAccess soa(self);
     ObjPtr<mirror::ClassLoader> class_loader = GetAppClassLoader();
@@ -1161,7 +1162,7 @@ void ImageWriter::AssignImageBinSlot(mirror::Object* object, size_t oat_index) {
       if (dirty_image_objects_ != nullptr &&
           dirty_image_objects_->find(klass->PrettyDescriptor()) != dirty_image_objects_->end()) {
         bin = Bin::kKnownDirty;
-      } else if (klass->GetStatus() == ClassStatus::kInitialized) {
+      } else if (klass->GetStatus() == ClassStatus::kVisiblyInitialized) {
         bin = Bin::kClassInitialized;
 
         // If the class's static fields are all final, put it into a separate bin
@@ -1225,7 +1226,8 @@ bool ImageWriter::WillMethodBeDirty(ArtMethod* m) const {
   }
   ObjPtr<mirror::Class> declaring_class = m->GetDeclaringClass();
   // Initialized is highly unlikely to dirty since there's no entry points to mutate.
-  return declaring_class == nullptr || declaring_class->GetStatus() != ClassStatus::kInitialized;
+  return declaring_class == nullptr ||
+         declaring_class->GetStatus() != ClassStatus::kVisiblyInitialized;
 }
 
 bool ImageWriter::IsImageBinSlotAssigned(mirror::Object* object) const {
@@ -1354,10 +1356,6 @@ class ImageWriter::PruneObjectReferenceVisitor {
                                  ObjPtr<mirror::Reference> ref) const
       REQUIRES_SHARED(Locks::mutator_lock_) {
     operator()(ref, mirror::Reference::ReferentOffset(), /* is_static */ false);
-  }
-
-  ALWAYS_INLINE bool GetResult() const {
-    return result_;
   }
 
  private:

@@ -164,6 +164,7 @@ class OatFileBase : public OatFile {
 
   virtual void PreSetup(const std::string& elf_filename) = 0;
 
+  // Setup functions return true on success, false on failure.
   bool Setup(int zip_fd, const char* abs_dex_location, std::string* error_msg);
   bool Setup(const std::vector<const DexFile*>& dex_files);
 
@@ -1151,6 +1152,11 @@ void DlOpenOatFile::PreSetup(const std::string& elf_filename) {
   LOG(FATAL) << "Should not reach here.";
   UNREACHABLE();
 #else
+  struct DummyMapData {
+    const char* name;
+    uint8_t* vaddr;
+    size_t memsz;
+  };
   struct dl_iterate_context {
     static int callback(dl_phdr_info* info, size_t size ATTRIBUTE_UNUSED, void* data) {
       auto* context = reinterpret_cast<dl_iterate_context*>(data);
@@ -1185,8 +1191,18 @@ void DlOpenOatFile::PreSetup(const std::string& elf_filename) {
             uint8_t* vaddr = reinterpret_cast<uint8_t*>(info->dlpi_addr +
                 info->dlpi_phdr[i].p_vaddr);
             size_t memsz = info->dlpi_phdr[i].p_memsz;
-            MemMap mmap = MemMap::MapDummy(info->dlpi_name, vaddr, memsz);
-            context->dlopen_mmaps_->push_back(std::move(mmap));
+            size_t name_size = strlen(info->dlpi_name) + 1u;
+            std::vector<char>* dummy_maps_names = context->dummy_maps_names_;
+            // We must not allocate any memory in the callback, see b/156312036 .
+            if (name_size < dummy_maps_names->capacity() - dummy_maps_names->size() &&
+                context->dummy_maps_data_->size() < context->dummy_maps_data_->capacity()) {
+              dummy_maps_names->insert(
+                  dummy_maps_names->end(), info->dlpi_name, info->dlpi_name + name_size);
+              const char* name = &(*dummy_maps_names)[dummy_maps_names->size() - name_size];
+              context->dummy_maps_data_->push_back({ name, vaddr, memsz });
+            }
+            context->num_dummy_maps_ += 1u;
+            context->dummy_maps_names_size_ += name_size;
           }
         }
         return 1;  // Stop iteration and return 1 from dl_iterate_phdr.
@@ -1194,23 +1210,70 @@ void DlOpenOatFile::PreSetup(const std::string& elf_filename) {
       return 0;  // Continue iteration and return 0 from dl_iterate_phdr when finished.
     }
     const uint8_t* const begin_;
-    std::vector<MemMap>* const dlopen_mmaps_;
-    const size_t shared_objects_before;
+    std::vector<DummyMapData>* dummy_maps_data_;
+    size_t num_dummy_maps_;
+    std::vector<char>* dummy_maps_names_;
+    size_t dummy_maps_names_size_;
+    size_t shared_objects_before;
     size_t shared_objects_seen;
   };
-  dl_iterate_context context = { Begin(), &dlopen_mmaps_, shared_objects_before_, 0};
+
+  // We must not allocate any memory in the callback, see b/156312036 .
+  // Therefore we pre-allocate storage for the data we need for creating the dummy maps.
+  std::vector<DummyMapData> dummy_maps_data;
+  dummy_maps_data.reserve(32);  // 32 should be enough. If not, we'll retry.
+  std::vector<char> dummy_maps_names;
+  dummy_maps_names.reserve(4 * KB);  // 4KiB should be enough. If not, we'll retry.
+
+  dl_iterate_context context = {
+      Begin(),
+      &dummy_maps_data,
+      /*num_dummy_maps_*/ 0u,
+      &dummy_maps_names,
+      /*dummy_maps_names_size_*/ 0u,
+      shared_objects_before_,
+      /*shared_objects_seen*/ 0u
+  };
 
   if (dl_iterate_phdr(dl_iterate_context::callback, &context) == 0) {
     // Hm. Maybe our optimization went wrong. Try another time with shared_objects_before == 0
     // before giving up. This should be unusual.
     VLOG(oat) << "Need a second run in PreSetup, didn't find with shared_objects_before="
               << shared_objects_before_;
-    dl_iterate_context context0 = { Begin(), &dlopen_mmaps_, 0, 0};
-    if (dl_iterate_phdr(dl_iterate_context::callback, &context0) == 0) {
+    DCHECK(dummy_maps_data.empty());
+    DCHECK_EQ(context.num_dummy_maps_, 0u);
+    DCHECK(dummy_maps_names.empty());
+    DCHECK_EQ(context.dummy_maps_names_size_, 0u);
+    context.shared_objects_before = 0u;
+    context.shared_objects_seen = 0u;
+    if (dl_iterate_phdr(dl_iterate_context::callback, &context) == 0) {
       // OK, give up and print an error.
       PrintFileToLog("/proc/self/maps", android::base::LogSeverity::WARNING);
       LOG(ERROR) << "File " << elf_filename << " loaded with dlopen but cannot find its mmaps.";
     }
+  }
+
+  if (dummy_maps_data.size() < context.num_dummy_maps_) {
+    // Insufficient capacity. Reserve more space and retry.
+    dummy_maps_data.clear();
+    dummy_maps_data.reserve(context.num_dummy_maps_);
+    context.num_dummy_maps_ = 0u;
+    dummy_maps_names.clear();
+    dummy_maps_names.reserve(context.dummy_maps_names_size_);
+    context.dummy_maps_names_size_ = 0u;
+    context.shared_objects_before = 0u;
+    context.shared_objects_seen = 0u;
+    bool success = (dl_iterate_phdr(dl_iterate_context::callback, &context) != 0);
+    CHECK(success);
+  }
+
+  CHECK_EQ(dummy_maps_data.size(), context.num_dummy_maps_);
+  CHECK_EQ(dummy_maps_names.size(), context.dummy_maps_names_size_);
+  DCHECK_EQ(static_cast<size_t>(std::count(dummy_maps_names.begin(), dummy_maps_names.end(), '\0')),
+            context.num_dummy_maps_);
+  for (const DummyMapData& data : dummy_maps_data) {
+    MemMap mmap = MemMap::MapDummy(data.name, data.vaddr, data.memsz);
+    dlopen_mmaps_.push_back(std::move(mmap));
   }
 #endif
 }
@@ -1414,12 +1477,13 @@ class OatFileBackedByVdex final : public OatFileBase {
                                    std::unique_ptr<VdexFile>&& vdex_file,
                                    const std::string& location) {
     std::unique_ptr<OatFileBackedByVdex> oat_file(new OatFileBackedByVdex(location));
-    oat_file->Initialize(dex_files, std::move(vdex_file));
+    if (!oat_file->Setup(dex_files, std::move(vdex_file))) {
+      return nullptr;
+    }
     return oat_file.release();
   }
 
-  void Initialize(const std::vector<const DexFile*>& dex_files,
-                  std::unique_ptr<VdexFile>&& vdex_file) {
+  bool Setup(const std::vector<const DexFile*>& dex_files, std::unique_ptr<VdexFile>&& vdex_file) {
     DCHECK(!IsExecutable());
 
     // SetVdex will take ownership of the VdexFile.
@@ -1442,10 +1506,18 @@ class OatFileBackedByVdex final : public OatFileBase {
 
     // Load VerifierDeps from VDEX and copy bit vectors of verified classes.
     ArrayRef<const uint8_t> deps_data = GetVdexFile()->GetVerifierDepsData();
-    verified_classes_per_dex_ = verifier::VerifierDeps::ParseVerifiedClasses(dex_files, deps_data);
+    if (!verifier::VerifierDeps::ParseVerifiedClasses(dex_files,
+                                                      deps_data,
+                                                      &verified_classes_per_dex_)) {
+      return false;
+    }
 
     // Initialize OatDexFiles.
-    Setup(dex_files);
+    if (!OatFileBase::Setup(dex_files)) {
+      return false;
+    }
+
+    return true;
   }
 
   bool IsClassVerifiedInVdex(const OatDexFile& oat_dex_file, uint16_t class_def_index) const {

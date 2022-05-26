@@ -2141,23 +2141,25 @@ void Thread::DumpJavaStack(std::ostream& os, bool check_suspended, bool dump_loc
   // assumption that there is no exception pending on entry. Thus, stash any pending exception.
   // Thread::Current() instead of this in case a thread is dumping the stack of another suspended
   // thread.
-  StackHandleScope<1> scope(Thread::Current());
-  Handle<mirror::Throwable> exc;
-  bool have_exception = false;
-  if (IsExceptionPending()) {
-    exc = scope.NewHandle(GetException());
-    const_cast<Thread*>(this)->ClearException();
-    have_exception = true;
-  }
+  struct ScopedExceptionStorage {
+    ScopedExceptionStorage() : scope(Thread::Current()) {
+      exc = scope.NewHandle(scope.Self()->GetException());
+      scope.Self()->ClearException();
+    }
+    ~ScopedExceptionStorage() {
+      if (exc != nullptr) {
+        scope.Self()->SetException(exc.Get());
+      }
+    }
+    StackHandleScope<1> scope;
+    Handle<mirror::Throwable> exc;
+  };
+  ScopedExceptionStorage ses;
 
   std::unique_ptr<Context> context(Context::Create());
   StackDumpVisitor dumper(os, const_cast<Thread*>(this), context.get(),
                           !tls32_.throwing_OutOfMemoryError, check_suspended, dump_locks);
   dumper.WalkStack();
-
-  if (have_exception) {
-    const_cast<Thread*>(this)->SetException(exc.Get());
-  }
 }
 
 void Thread::DumpStack(std::ostream& os,
@@ -3547,7 +3549,7 @@ void Thread::QuickDeliverException() {
     // Instrumentation may cause GC so keep the exception object safe.
     StackHandleScope<1> hs(this);
     HandleWrapperObjPtr<mirror::Throwable> h_exception(hs.NewHandleWrapper(&exception));
-    instrumentation->ExceptionThrownEvent(this, exception.Ptr());
+    instrumentation->ExceptionThrownEvent(this, exception);
   }
   // Does instrumentation need to deoptimize the stack or otherwise go to interpreter for something?
   // Note: we do this *after* reporting the exception to instrumentation in case it now requires
@@ -3708,7 +3710,6 @@ class ReferenceMapVisitor : public StackVisitor {
     VisitDeclaringClass(m);
     DCHECK(m != nullptr);
     size_t num_regs = shadow_frame->NumberOfVRegs();
-    DCHECK(m->IsNative() || shadow_frame->HasReferenceArray());
     // handle scope for JNI or References for interpreter.
     for (size_t reg = 0; reg < num_regs; ++reg) {
       mirror::Object* ref = shadow_frame->GetVRegReference(reg);
@@ -3781,9 +3782,9 @@ class ReferenceMapVisitor : public StackVisitor {
       StackReference<mirror::Object>* vreg_base =
           reinterpret_cast<StackReference<mirror::Object>*>(cur_quick_frame);
       uintptr_t native_pc_offset = method_header->NativeQuickPcOffset(GetCurrentQuickFramePc());
-      CodeInfo code_info(method_header, kPrecise
-          ? CodeInfo::DecodeFlags::AllTables  // We will need dex register maps.
-          : CodeInfo::DecodeFlags::GcMasksOnly);
+      CodeInfo code_info = kPrecise
+          ? CodeInfo(method_header)  // We will need dex register maps.
+          : CodeInfo::DecodeGcMasksOnly(method_header);
       StackMap map = code_info.GetStackMapForNativePcOffset(native_pc_offset);
       DCHECK(map.IsValid());
 
@@ -3889,6 +3890,7 @@ class ReferenceMapVisitor : public StackVisitor {
             code_info(_code_info),
             dex_register_map(code_info.GetDexRegisterMapOf(map)),
             visitor(_visitor) {
+        DCHECK_EQ(dex_register_map.size(), number_of_dex_registers);
       }
 
       // TODO: If necessary, we should consider caching a reverse map instead of the linear

@@ -220,7 +220,11 @@ static jobjectArray Class_getInterfacesInternal(JNIEnv* env, jobject javaThis) {
   Handle<mirror::Class> klass = hs.NewHandle(DecodeClass(soa, javaThis));
 
   if (klass->IsProxyClass()) {
-    return soa.AddLocalReference<jobjectArray>(klass->GetProxyInterfaces()->Clone(soa.Self()));
+    StackHandleScope<1> hs2(soa.Self());
+    Handle<mirror::ObjectArray<mirror::Class>> interfaces =
+        hs2.NewHandle(klass->GetProxyInterfaces());
+    return soa.AddLocalReference<jobjectArray>(
+        mirror::ObjectArray<mirror::Class>::Clone(interfaces, soa.Self()));
   }
 
   const dex::TypeList* iface_list = klass->GetInterfaceTypeList();
@@ -823,7 +827,7 @@ static jobject Class_newInstance(JNIEnv* env, jobject javaThis) {
   // Invoke the string allocator to return an empty string for the string class.
   if (klass->IsStringClass()) {
     gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
-    ObjPtr<mirror::Object> obj = mirror::String::AllocEmptyString<true>(soa.Self(), allocator_type);
+    ObjPtr<mirror::Object> obj = mirror::String::AllocEmptyString(soa.Self(), allocator_type);
     if (UNLIKELY(soa.Self()->IsExceptionPending())) {
       return nullptr;
     } else {
@@ -842,9 +846,9 @@ static jobject Class_newInstance(JNIEnv* env, jobject javaThis) {
       caller.Assign(GetCallingClass(soa.Self(), 1));
     }
     if (UNLIKELY(caller != nullptr && !VerifyAccess(receiver.Get(),
-                                                          declaring_class,
-                                                          constructor->GetAccessFlags(),
-                                                          caller.Get()))) {
+                                                    declaring_class,
+                                                    constructor->GetAccessFlags(),
+                                                    caller.Get()))) {
       soa.Self()->ThrowNewExceptionF(
           "Ljava/lang/IllegalAccessException;", "%s is not accessible from %s",
           constructor->PrettyMethod().c_str(), caller->PrettyClass().c_str());
@@ -852,12 +856,15 @@ static jobject Class_newInstance(JNIEnv* env, jobject javaThis) {
     }
   }
   // Ensure that we are initialized.
-  if (UNLIKELY(!declaring_class->IsInitialized())) {
-    if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(
-        soa.Self(), hs.NewHandle(declaring_class), true, true)) {
-      soa.Self()->AssertPendingException();
+  if (UNLIKELY(!declaring_class->IsVisiblyInitialized())) {
+    Thread* self = soa.Self();
+    Handle<mirror::Class> h_class = hs.NewHandle(declaring_class);
+    if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(
+                      self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true))) {
+      DCHECK(self->IsExceptionPending());
       return nullptr;
     }
+    DCHECK(h_class->IsInitializing());
   }
   // Invoke the constructor.
   JValue result;
@@ -870,7 +877,7 @@ static jobject Class_newInstance(JNIEnv* env, jobject javaThis) {
   return soa.AddLocalReference<jobject>(receiver.Get());
 }
 
-static JNINativeMethod gMethods[] = {
+static const JNINativeMethod gMethods[] = {
   FAST_NATIVE_METHOD(Class, classForName,
                 "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;"),
   FAST_NATIVE_METHOD(Class, getDeclaredAnnotation,

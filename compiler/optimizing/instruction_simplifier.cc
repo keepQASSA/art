@@ -25,6 +25,7 @@
 #include "mirror/class-inl.h"
 #include "scoped_thread_state_change-inl.h"
 #include "sharpening.h"
+#include "string_builder_append.h"
 
 namespace art {
 
@@ -36,10 +37,12 @@ class InstructionSimplifierVisitor : public HGraphDelegateVisitor {
  public:
   InstructionSimplifierVisitor(HGraph* graph,
                                CodeGenerator* codegen,
-                               OptimizingCompilerStats* stats)
+                               OptimizingCompilerStats* stats,
+                               bool be_loop_friendly)
       : HGraphDelegateVisitor(graph),
         codegen_(codegen),
-        stats_(stats) {}
+        stats_(stats),
+        be_loop_friendly_(be_loop_friendly) {}
 
   bool Run();
 
@@ -64,6 +67,7 @@ class InstructionSimplifierVisitor : public HGraphDelegateVisitor {
   bool TryHandleAssociativeAndCommutativeOperation(HBinaryOperation* instruction);
   bool TrySubtractionChainSimplification(HBinaryOperation* instruction);
   bool TryCombineVecMultiplyAccumulate(HVecMul* mul);
+  void TryToReuseDiv(HRem* rem);
 
   void VisitShift(HBinaryOperation* shift);
   void VisitEqual(HEqual* equal) override;
@@ -89,6 +93,7 @@ class InstructionSimplifierVisitor : public HGraphDelegateVisitor {
   void VisitAbove(HAbove* condition) override;
   void VisitAboveOrEqual(HAboveOrEqual* condition) override;
   void VisitDiv(HDiv* instruction) override;
+  void VisitRem(HRem* instruction) override;
   void VisitMul(HMul* instruction) override;
   void VisitNeg(HNeg* instruction) override;
   void VisitNot(HNot* instruction) override;
@@ -128,6 +133,13 @@ class InstructionSimplifierVisitor : public HGraphDelegateVisitor {
   OptimizingCompilerStats* stats_;
   bool simplification_occurred_ = false;
   int simplifications_at_current_position_ = 0;
+  // Prohibit optimizations which can affect HInductionVarAnalysis/HLoopOptimization
+  // and prevent loop optimizations:
+  //   true - avoid such optimizations.
+  //   false - allow such optimizations.
+  // Checked by the following optimizations:
+  //   - TryToReuseDiv: simplification of Div+Rem into Div+Mul+Sub.
+  bool be_loop_friendly_;
   // We ensure we do not loop infinitely. The value should not be too high, since that
   // would allow looping around the same basic block too many times. The value should
   // not be too low either, however, since we want to allow revisiting a basic block
@@ -141,7 +153,9 @@ bool InstructionSimplifier::Run() {
     visitor.VisitReversePostOrder();
   }
 
-  InstructionSimplifierVisitor visitor(graph_, codegen_, stats_);
+  bool be_loop_friendly = (use_all_optimizations_ == false);
+
+  InstructionSimplifierVisitor visitor(graph_, codegen_, stats_, be_loop_friendly);
   return visitor.Run();
 }
 
@@ -1708,6 +1722,71 @@ void InstructionSimplifierVisitor::VisitDiv(HDiv* instruction) {
   }
 }
 
+
+// Search HDiv having the specified dividend and divisor which is in the specified basic block.
+// Return nullptr if nothing has been found.
+static HInstruction* FindDivWithInputsInBasicBlock(HInstruction* dividend,
+                                                   HInstruction* divisor,
+                                                   HBasicBlock* basic_block) {
+  for (const HUseListNode<HInstruction*>& use : dividend->GetUses()) {
+    HInstruction* user = use.GetUser();
+    if (user->GetBlock() == basic_block && user->IsDiv() && user->InputAt(1) == divisor) {
+      return user;
+    }
+  }
+  return nullptr;
+}
+
+// If there is Div with the same inputs as Rem and in the same basic block, it can be reused.
+// Rem is replaced with Mul+Sub which use the found Div.
+void InstructionSimplifierVisitor::TryToReuseDiv(HRem* rem) {
+  // As the optimization replaces Rem with Mul+Sub they prevent some loop optimizations
+  // if the Rem is in a loop.
+  // Check if it is allowed to optimize such Rems.
+  if (rem->IsInLoop() && be_loop_friendly_) {
+    return;
+  }
+  DataType::Type type = rem->GetResultType();
+  if (!DataType::IsIntOrLongType(type)) {
+    return;
+  }
+
+  HBasicBlock* basic_block = rem->GetBlock();
+  HInstruction* dividend = rem->GetLeft();
+  HInstruction* divisor = rem->GetRight();
+
+  if (divisor->IsConstant()) {
+    HConstant* input_cst = rem->GetConstantRight();
+    DCHECK(input_cst->IsIntConstant() || input_cst->IsLongConstant());
+    int64_t cst_value = Int64FromConstant(input_cst);
+    if (cst_value == std::numeric_limits<int64_t>::min() || IsPowerOfTwo(std::abs(cst_value))) {
+      // Such cases are usually handled in the code generator because they don't need Div at all.
+      return;
+    }
+  }
+
+  HInstruction* quotient = FindDivWithInputsInBasicBlock(dividend, divisor, basic_block);
+  if (quotient == nullptr) {
+    return;
+  }
+  if (!quotient->StrictlyDominates(rem)) {
+    quotient->MoveBefore(rem);
+  }
+
+  ArenaAllocator* allocator = GetGraph()->GetAllocator();
+  HInstruction* mul = new (allocator) HMul(type, quotient, divisor);
+  basic_block->InsertInstructionBefore(mul, rem);
+  HInstruction* sub = new (allocator) HSub(type, dividend, mul);
+  basic_block->InsertInstructionBefore(sub, rem);
+  rem->ReplaceWith(sub);
+  basic_block->RemoveInstruction(rem);
+  RecordSimplification();
+}
+
+void InstructionSimplifierVisitor::VisitRem(HRem* rem) {
+  TryToReuseDiv(rem);
+}
+
 void InstructionSimplifierVisitor::VisitMul(HMul* instruction) {
   HConstant* input_cst = instruction->GetConstantRight();
   HInstruction* input_other = instruction->GetLeastConstantLeft();
@@ -2467,6 +2546,188 @@ static bool NoEscapeForStringBufferReference(HInstruction* reference, HInstructi
   return false;
 }
 
+static bool TryReplaceStringBuilderAppend(HInvoke* invoke) {
+  DCHECK_EQ(invoke->GetIntrinsic(), Intrinsics::kStringBuilderToString);
+  if (invoke->CanThrowIntoCatchBlock()) {
+    return false;
+  }
+
+  HBasicBlock* block = invoke->GetBlock();
+  HInstruction* sb = invoke->InputAt(0);
+
+  // We support only a new StringBuilder, otherwise we cannot ensure that
+  // the StringBuilder data does not need to be populated for other users.
+  if (!sb->IsNewInstance()) {
+    return false;
+  }
+
+  // For now, we support only single-block recognition.
+  // (Ternary operators feeding the append could be implemented.)
+  for (const HUseListNode<HInstruction*>& use : sb->GetUses()) {
+    if (use.GetUser()->GetBlock() != block) {
+      return false;
+    }
+  }
+
+  // Collect args and check for unexpected uses.
+  // We expect one call to a constructor with no arguments, one constructor fence (unless
+  // eliminated), some number of append calls and one call to StringBuilder.toString().
+  bool seen_constructor = false;
+  bool seen_constructor_fence = false;
+  bool seen_to_string = false;
+  uint32_t format = 0u;
+  uint32_t num_args = 0u;
+  HInstruction* args[StringBuilderAppend::kMaxArgs];  // Added in reverse order.
+  for (const HUseListNode<HInstruction*>& use : sb->GetUses()) {
+    // The append pattern uses the StringBuilder only as the first argument.
+    if (use.GetIndex() != 0u) {
+      return false;
+    }
+    // We see the uses in reverse order because they are inserted at the front
+    // of the singly-linked list, so the StringBuilder.append() must come first.
+    HInstruction* user = use.GetUser();
+    if (!seen_to_string) {
+      if (user->IsInvokeVirtual() &&
+          user->AsInvokeVirtual()->GetIntrinsic() == Intrinsics::kStringBuilderToString) {
+        seen_to_string = true;
+        continue;
+      } else {
+        return false;
+      }
+    }
+    // Then we should see the arguments.
+    if (user->IsInvokeVirtual()) {
+      HInvokeVirtual* as_invoke_virtual = user->AsInvokeVirtual();
+      DCHECK(!seen_constructor);
+      DCHECK(!seen_constructor_fence);
+      StringBuilderAppend::Argument arg;
+      switch (as_invoke_virtual->GetIntrinsic()) {
+        case Intrinsics::kStringBuilderAppendObject:
+          // TODO: Unimplemented, needs to call String.valueOf().
+          return false;
+        case Intrinsics::kStringBuilderAppendString:
+          arg = StringBuilderAppend::Argument::kString;
+          break;
+        case Intrinsics::kStringBuilderAppendCharArray:
+          // TODO: Unimplemented, StringBuilder.append(char[]) can throw NPE and we would
+          // not have the correct stack trace for it.
+          return false;
+        case Intrinsics::kStringBuilderAppendBoolean:
+          arg = StringBuilderAppend::Argument::kBoolean;
+          break;
+        case Intrinsics::kStringBuilderAppendChar:
+          arg = StringBuilderAppend::Argument::kChar;
+          break;
+        case Intrinsics::kStringBuilderAppendInt:
+          arg = StringBuilderAppend::Argument::kInt;
+          break;
+        case Intrinsics::kStringBuilderAppendLong:
+          arg = StringBuilderAppend::Argument::kLong;
+          break;
+        case Intrinsics::kStringBuilderAppendCharSequence: {
+          ReferenceTypeInfo rti = user->AsInvokeVirtual()->InputAt(1)->GetReferenceTypeInfo();
+          if (!rti.IsValid()) {
+            return false;
+          }
+          ScopedObjectAccess soa(Thread::Current());
+          Handle<mirror::Class> input_type = rti.GetTypeHandle();
+          DCHECK(input_type != nullptr);
+          if (input_type.Get() == GetClassRoot<mirror::String>()) {
+            arg = StringBuilderAppend::Argument::kString;
+          } else {
+            // TODO: Check and implement for StringBuilder. We could find the StringBuilder's
+            // internal char[] inconsistent with the length, or the string compression
+            // of the result could be compromised with a concurrent modification, and
+            // we would need to throw appropriate exceptions.
+            return false;
+          }
+          break;
+        }
+        case Intrinsics::kStringBuilderAppendFloat:
+        case Intrinsics::kStringBuilderAppendDouble:
+          // TODO: Unimplemented, needs to call FloatingDecimal.getBinaryToASCIIConverter().
+          return false;
+        default: {
+          return false;
+        }
+      }
+      // Uses of the append return value should have been replaced with the first input.
+      DCHECK(!as_invoke_virtual->HasUses());
+      DCHECK(!as_invoke_virtual->HasEnvironmentUses());
+      if (num_args == StringBuilderAppend::kMaxArgs) {
+        return false;
+      }
+      format = (format << StringBuilderAppend::kBitsPerArg) | static_cast<uint32_t>(arg);
+      args[num_args] = as_invoke_virtual->InputAt(1u);
+      ++num_args;
+    } else if (user->IsInvokeStaticOrDirect() &&
+               user->AsInvokeStaticOrDirect()->GetResolvedMethod() != nullptr &&
+               user->AsInvokeStaticOrDirect()->GetResolvedMethod()->IsConstructor() &&
+               user->AsInvokeStaticOrDirect()->GetNumberOfArguments() == 1u) {
+      // After arguments, we should see the constructor.
+      // We accept only the constructor with no extra arguments.
+      DCHECK(!seen_constructor);
+      DCHECK(!seen_constructor_fence);
+      seen_constructor = true;
+    } else if (user->IsConstructorFence()) {
+      // The last use we see is the constructor fence.
+      DCHECK(seen_constructor);
+      DCHECK(!seen_constructor_fence);
+      seen_constructor_fence = true;
+    } else {
+      return false;
+    }
+  }
+
+  if (num_args == 0u) {
+    return false;
+  }
+
+  // Check environment uses.
+  for (const HUseListNode<HEnvironment*>& use : sb->GetEnvUses()) {
+    HInstruction* holder = use.GetUser()->GetHolder();
+    if (holder->GetBlock() != block) {
+      return false;
+    }
+    // Accept only calls on the StringBuilder (which shall all be removed).
+    // TODO: Carve-out for const-string? Or rely on environment pruning (to be implemented)?
+    if (holder->InputCount() == 0 || holder->InputAt(0) != sb) {
+      return false;
+    }
+  }
+
+  // Create replacement instruction.
+  HIntConstant* fmt = block->GetGraph()->GetIntConstant(static_cast<int32_t>(format));
+  ArenaAllocator* allocator = block->GetGraph()->GetAllocator();
+  HStringBuilderAppend* append =
+      new (allocator) HStringBuilderAppend(fmt, num_args, allocator, invoke->GetDexPc());
+  append->SetReferenceTypeInfo(invoke->GetReferenceTypeInfo());
+  for (size_t i = 0; i != num_args; ++i) {
+    append->SetArgumentAt(i, args[num_args - 1u - i]);
+  }
+  block->InsertInstructionBefore(append, invoke);
+  invoke->ReplaceWith(append);
+  // Copy environment, except for the StringBuilder uses.
+  for (HEnvironment* env = invoke->GetEnvironment(); env != nullptr; env = env->GetParent()) {
+    for (size_t i = 0, size = env->Size(); i != size; ++i) {
+      if (env->GetInstructionAt(i) == sb) {
+        env->RemoveAsUserOfInput(i);
+        env->SetRawEnvAt(i, /*instruction=*/ nullptr);
+      }
+    }
+  }
+  append->CopyEnvironmentFrom(invoke->GetEnvironment());
+  // Remove the old instruction.
+  block->RemoveInstruction(invoke);
+  // Remove the StringBuilder's uses and StringBuilder.
+  while (sb->HasNonEnvironmentUses()) {
+    block->RemoveInstruction(sb->GetUses().front().GetUser());
+  }
+  DCHECK(!sb->HasEnvironmentUses());
+  block->RemoveInstruction(sb);
+  return true;
+}
+
 // Certain allocation intrinsics are not removed by dead code elimination
 // because of potentially throwing an OOM exception or other side effects.
 // This method removes such intrinsics when special circumstances allow.
@@ -2481,6 +2742,9 @@ void InstructionSimplifierVisitor::SimplifyAllocationIntrinsic(HInvoke* invoke) 
       invoke->GetBlock()->RemoveInstruction(invoke);
       RecordSimplification();
     }
+  } else if (invoke->GetIntrinsic() == Intrinsics::kStringBuilderToString &&
+             TryReplaceStringBuilderAppend(invoke)) {
+    RecordSimplification();
   }
 }
 
@@ -2569,7 +2833,16 @@ void InstructionSimplifierVisitor::VisitInvoke(HInvoke* instruction) {
       SimplifyNPEOnArgN(instruction, 1);  // 0th has own NullCheck
       break;
     case Intrinsics::kStringBufferAppend:
-    case Intrinsics::kStringBuilderAppend:
+    case Intrinsics::kStringBuilderAppendObject:
+    case Intrinsics::kStringBuilderAppendString:
+    case Intrinsics::kStringBuilderAppendCharSequence:
+    case Intrinsics::kStringBuilderAppendCharArray:
+    case Intrinsics::kStringBuilderAppendBoolean:
+    case Intrinsics::kStringBuilderAppendChar:
+    case Intrinsics::kStringBuilderAppendInt:
+    case Intrinsics::kStringBuilderAppendLong:
+    case Intrinsics::kStringBuilderAppendFloat:
+    case Intrinsics::kStringBuilderAppendDouble:
       SimplifyReturnThis(instruction);
       break;
     case Intrinsics::kStringBufferToString:

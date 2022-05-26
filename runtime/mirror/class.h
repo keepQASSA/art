@@ -86,17 +86,23 @@ class MANAGED Class final : public Object {
   static constexpr uint32_t kPrimitiveTypeSizeShiftShift = 16;
   static constexpr uint32_t kPrimitiveTypeMask = (1u << kPrimitiveTypeSizeShiftShift) - 1;
 
-  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+           bool kWithSynchronizationBarrier = true>
   ClassStatus GetStatus() REQUIRES_SHARED(Locks::mutator_lock_) {
+    // Reading the field without barrier is used exclusively for IsVisiblyInitialized().
+    int32_t field_value = kWithSynchronizationBarrier
+        ? GetField32Volatile<kVerifyFlags>(StatusOffset())
+        : GetField32<kVerifyFlags>(StatusOffset());
     // Avoid including "subtype_check_bits_and_status.h" to get the field.
     // The ClassStatus is always in the 4 most-significant bits of status_.
-    return enum_cast<ClassStatus>(
-        static_cast<uint32_t>(GetField32Volatile<kVerifyFlags>(StatusOffset())) >> (32 - 4));
+    return enum_cast<ClassStatus>(static_cast<uint32_t>(field_value) >> (32 - 4));
   }
 
   // This is static because 'this' may be moved by GC.
   static void SetStatus(Handle<Class> h_this, ClassStatus new_status, Thread* self)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
+
+  void SetStatusForPrimitiveOrArray(ClassStatus new_status) REQUIRES_SHARED(Locks::mutator_lock_);
 
   static constexpr MemberOffset StatusOffset() {
     return MemberOffset(OFFSET_OF_OBJECT_MEMBER(Class, status_));
@@ -171,7 +177,15 @@ class MANAGED Class final : public Object {
   // Returns true if the class is initialized.
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   bool IsInitialized() REQUIRES_SHARED(Locks::mutator_lock_) {
-    return GetStatus<kVerifyFlags>() == ClassStatus::kInitialized;
+    return GetStatus<kVerifyFlags>() >= ClassStatus::kInitialized;
+  }
+
+  // Returns true if the class is visibly initialized.
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  bool IsVisiblyInitialized() REQUIRES_SHARED(Locks::mutator_lock_) {
+    // Note: Avoiding the synchronization barrier for the visibly initialized check.
+    ClassStatus status = GetStatus<kVerifyFlags, /*kWithSynchronizationBarrier=*/ false>();
+    return status == ClassStatus::kVisiblyInitialized;
   }
 
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
@@ -464,7 +478,7 @@ class MANAGED Class final : public Object {
   bool IsPrimitiveArray() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Creates a raw object instance but does not invoke the default constructor.
-  template<bool kIsInstrumented, bool kCheckAddFinalizer = true>
+  template<bool kIsInstrumented = true, bool kCheckAddFinalizer = true>
   ALWAYS_INLINE ObjPtr<Object> Alloc(Thread* self, gc::AllocatorType allocator_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
@@ -1064,7 +1078,7 @@ class MANAGED Class final : public Object {
   // Returns the ExtData for this class, allocating one if necessary. This should be the only way
   // to force ext_data_ to be set. No functions are available for changing an already set ext_data_
   // since doing so is not allowed.
-  ObjPtr<ClassExt> EnsureExtDataPresent(Thread* self)
+  static ObjPtr<ClassExt> EnsureExtDataPresent(Handle<Class> h_this, Thread* self)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
   uint16_t GetDexClassDefIndex() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -1137,7 +1151,11 @@ class MANAGED Class final : public Object {
   void AssertInitializedOrInitializingInThread(Thread* self)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ObjPtr<Class> CopyOf(Thread* self, int32_t new_length, ImTable* imt, PointerSize pointer_size)
+  static ObjPtr<Class> CopyOf(Handle<Class> h_this,
+                              Thread* self,
+                              int32_t new_length,
+                              ImTable* imt,
+                              PointerSize pointer_size)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
   // For proxy class only.

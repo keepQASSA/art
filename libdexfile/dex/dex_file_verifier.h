@@ -17,8 +17,8 @@
 #ifndef ART_LIBDEXFILE_DEX_DEX_FILE_VERIFIER_H_
 #define ART_LIBDEXFILE_DEX_DEX_FILE_VERIFIER_H_
 
+#include <bitset>
 #include <limits>
-#include <unordered_set>
 
 #include "base/hash_map.h"
 #include "base/safe_map.h"
@@ -55,10 +55,10 @@ class DexFileVerifier {
         header_(&dex_file->GetHeader()),
         ptr_(nullptr),
         previous_item_(nullptr),
-        angle_bracket_start_index_(std::numeric_limits<size_t>::max()),
-        angle_bracket_end_index_(std::numeric_limits<size_t>::max()),
-        angle_init_angle_index_(std::numeric_limits<size_t>::max()),
-        angle_clinit_angle_index_(std::numeric_limits<size_t>::max()) {
+        init_indices_{std::numeric_limits<size_t>::max(),
+                      std::numeric_limits<size_t>::max(),
+                      std::numeric_limits<size_t>::max(),
+                      std::numeric_limits<size_t>::max()} {
   }
 
   bool Verify();
@@ -206,6 +206,12 @@ class DexFileVerifier {
 
   void FindStringRangesForMethodNames();
 
+  template <typename ExtraCheckFn>
+  bool VerifyTypeDescriptor(dex::TypeIndex idx,
+                            const char* error_msg1,
+                            const char* error_msg2,
+                            ExtraCheckFn extra_check);
+
   const DexFile* const dex_file_;
   const uint8_t* const begin_;
   const size_t size_;
@@ -246,9 +252,6 @@ class DexFileVerifier {
 
   std::string failure_reason_;
 
-  // Set of type ids for which there are ClassDef elements in the dex file.
-  std::unordered_set<decltype(dex::ClassDef::class_idx_)> defined_classes_;
-
   // Cached string indices for "interesting" entries wrt/ method names. Will be populated by
   // FindStringRangesForMethodNames (which is automatically called before verifying the
   // classdataitem section).
@@ -256,12 +259,24 @@ class DexFileVerifier {
   // Strings starting with '<' are in the range
   //    [angle_bracket_start_index_,angle_bracket_end_index_).
   // angle_init_angle_index_ and angle_clinit_angle_index_ denote the indices of "<init>" and
-  // angle_clinit_angle_index_, respectively. If any value is not found, the corresponding
-  // index will be larger than any valid string index for this dex file.
-  size_t angle_bracket_start_index_;
-  size_t angle_bracket_end_index_;
-  size_t angle_init_angle_index_;
-  size_t angle_clinit_angle_index_;
+  // "<clinit>", respectively. If any value is not found, the corresponding index will be larger
+  // than any valid string index for this dex file.
+  struct {
+    size_t angle_bracket_start_index;
+    size_t angle_bracket_end_index;
+    size_t angle_init_angle_index;
+    size_t angle_clinit_angle_index;
+  } init_indices_;
+
+  // A bitvector for verified type descriptors. Each bit corresponds to a type index. A set
+  // bit denotes that the descriptor has been verified wrt/ IsValidDescriptor.
+  std::vector<char> verified_type_descriptors_;
+
+  // Set of type ids for which there are ClassDef elements in the dex file. Using a bitset
+  // avoids all allocations. The bitset should be implemented as 8K of storage, which is
+  // tight enough for all callers.
+  static constexpr size_t kTypeIdSize = 65536u;
+  std::bitset<kTypeIdSize> defined_classes_;
 };
 
 }  // namespace art

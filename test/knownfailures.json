@@ -509,7 +509,8 @@
             "909-attach-agent",
             "924-threads",
             "981-dedup-original-dex",
-            "1900-track-alloc"
+            "1900-track-alloc",
+            "2230-profile-save-hotness"
         ],
         "description": ["Tests that require exact knowledge of the deoptimization state, the ",
                         "number of plugins and agents, or breaks other openjdkjvmti assumptions."],
@@ -867,6 +868,7 @@
           "167-visit-locks",
           "168-vmstack-annotated",
           "172-app-image-twice",
+          "177-visibly-initialized-deadlock",
           "201-built-in-except-detail-messages",
           "203-multi-checkpoint",
           "304-method-tracing",
@@ -942,6 +944,7 @@
           "574-irreducible-and-constant-area",
           "575-checker-string-init-alias",
           "580-checker-string-fact-intrinsics",
+          "580-fp16",
           "585-inline-unresolved",
           "586-checker-null-array-get",
           "587-inline-class-error",
@@ -1084,7 +1087,8 @@
           "1940-ddms-ext",
           "1945-proxy-method-arguments",
           "1946-list-descriptors",
-          "1947-breakpoint-redefine-deopt"
+          "1947-breakpoint-redefine-deopt",
+          "2230-profile-save-hotness"
         ],
         "variant": "jvm",
         "bug": "b/73888836",

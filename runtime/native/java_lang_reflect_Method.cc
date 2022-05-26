@@ -59,9 +59,11 @@ static jobjectArray Method_getExceptionTypes(JNIEnv* env, jobject javaMethod) {
       ++i;
     }
     CHECK_NE(throws_index, -1);
-    ObjPtr<mirror::ObjectArray<mirror::Class>> declared_exceptions =
-        klass->GetProxyThrows()->Get(throws_index);
-    return soa.AddLocalReference<jobjectArray>(declared_exceptions->Clone(soa.Self()));
+    StackHandleScope<1u> hs(soa.Self());
+    Handle<mirror::ObjectArray<mirror::Class>> declared_exceptions =
+        hs.NewHandle(klass->GetProxyThrows()->Get(throws_index));
+    return soa.AddLocalReference<jobjectArray>(
+        mirror::ObjectArray<mirror::Class>::Clone(declared_exceptions, soa.Self()));
   } else {
     ObjPtr<mirror::ObjectArray<mirror::Class>> result_array =
         annotations::GetExceptionTypesForMethod(method);
@@ -84,7 +86,7 @@ static jobject Method_invoke(JNIEnv* env, jobject javaMethod, jobject javaReceiv
   return InvokeMethod(soa, javaMethod, javaReceiver, javaArgs);
 }
 
-static JNINativeMethod gMethods[] = {
+static const JNINativeMethod gMethods[] = {
   FAST_NATIVE_METHOD(Method, getDefaultValue, "()Ljava/lang/Object;"),
   FAST_NATIVE_METHOD(Method, getExceptionTypes, "()[Ljava/lang/Class;"),
   FAST_NATIVE_METHOD(Method, invoke, "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"),

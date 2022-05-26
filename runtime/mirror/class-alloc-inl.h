@@ -53,13 +53,10 @@ inline ObjPtr<Object> Class::Alloc(Thread* self, gc::AllocatorType allocator_typ
   if (!kCheckAddFinalizer) {
     DCHECK(!IsFinalizable());
   }
-  // Note that the this pointer may be invalidated after the allocation.
+  // Note that the `this` pointer may be invalidated after the allocation.
   ObjPtr<Object> obj =
-      heap->AllocObjectWithAllocator<kIsInstrumented, false>(self,
-                                                             this,
-                                                             this->object_size_,
-                                                             allocator_type,
-                                                             VoidFunctor());
+      heap->AllocObjectWithAllocator<kIsInstrumented, /*kCheckLargeObject=*/ false>(
+          self, this, this->object_size_, allocator_type, VoidFunctor());
   if (add_finalizer && LIKELY(obj != nullptr)) {
     heap->AddFinalizerReference(self, &obj);
     if (UNLIKELY(self->IsExceptionPending())) {
@@ -71,11 +68,11 @@ inline ObjPtr<Object> Class::Alloc(Thread* self, gc::AllocatorType allocator_typ
 }
 
 inline ObjPtr<Object> Class::AllocObject(Thread* self) {
-  return Alloc<true>(self, Runtime::Current()->GetHeap()->GetCurrentAllocator());
+  return Alloc(self, Runtime::Current()->GetHeap()->GetCurrentAllocator());
 }
 
 inline ObjPtr<Object> Class::AllocNonMovableObject(Thread* self) {
-  return Alloc<true>(self, Runtime::Current()->GetHeap()->GetCurrentNonMovingAllocator());
+  return Alloc(self, Runtime::Current()->GetHeap()->GetCurrentNonMovingAllocator());
 }
 
 }  // namespace mirror

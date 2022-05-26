@@ -1156,12 +1156,15 @@ uint8_t* JitCodeCache::CommitCodeInternal(Thread* self,
         // This situation currently only occurs in the jit-zygote mode.
         DCHECK(Runtime::Current()->IsZygote());
         DCHECK(Runtime::Current()->IsUsingApexBootImageLocation());
-        DCHECK(method->GetProfilingInfo(kRuntimePointerSize) != nullptr);
         DCHECK(method->GetDeclaringClass()->GetClassLoader() == nullptr);
-        // Save the entrypoint, so it can be fethed later once the class is
-        // initialized.
-        method->GetProfilingInfo(kRuntimePointerSize)->SetSavedEntryPoint(
-            method_header->GetEntryPoint());
+        // TODO(ngeoffray): In most cases, the zygote will not have a profiling
+        // info for a compiled method. Use a map instead.
+        if (method->GetProfilingInfo(kRuntimePointerSize) != nullptr) {
+          // Save the entrypoint, so it can be fetched later once the class is
+          // initialized.
+          method->GetProfilingInfo(kRuntimePointerSize)->SetSavedEntryPoint(
+              method_header->GetEntryPoint());
+        }
       } else {
         Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(
             method, method_header->GetEntryPoint());
@@ -1593,8 +1596,6 @@ void JitCodeCache::GarbageCollectCache(Thread* self) {
           }
         }
 
-        DCHECK(CheckLiveCompiledCodeHasProfilingInfo());
-
         // Change entry points of native methods back to the GenericJNI entrypoint.
         for (const auto& entry : jni_stubs_map_) {
           const JniStubData& data = entry.second;
@@ -1772,28 +1773,7 @@ void JitCodeCache::DoCollection(Thread* self, bool collect_profiling_info) {
         return false;
       });
     profiling_infos_.erase(profiling_kept_end, profiling_infos_.end());
-    DCHECK(CheckLiveCompiledCodeHasProfilingInfo());
   }
-}
-
-bool JitCodeCache::CheckLiveCompiledCodeHasProfilingInfo() {
-  ScopedTrace trace(__FUNCTION__);
-  // Check that methods we have compiled do have a ProfilingInfo object. We would
-  // have memory leaks of compiled code otherwise.
-  for (const auto& it : method_code_map_) {
-    ArtMethod* method = it.second;
-    if (method->GetProfilingInfo(kRuntimePointerSize) == nullptr) {
-      const void* code_ptr = it.first;
-      const OatQuickMethodHeader* method_header = OatQuickMethodHeader::FromCodePointer(code_ptr);
-      if (method_header->GetEntryPoint() == method->GetEntryPointFromQuickCompiledCode()) {
-        // If the code is not dead, then we have a problem. Note that this can even
-        // happen just after a collection, as mutator threads are running in parallel
-        // and could deoptimize an existing compiled code.
-        return false;
-      }
-    }
-  }
-  return true;
 }
 
 OatQuickMethodHeader* JitCodeCache::LookupMethodHeader(uintptr_t pc, ArtMethod* method) {
@@ -1851,17 +1831,9 @@ OatQuickMethodHeader* JitCodeCache::LookupMethodHeader(uintptr_t pc, ArtMethod* 
   }
 
   if (kIsDebugBuild && method != nullptr && !method->IsNative()) {
-    // When we are walking the stack to redefine classes and creating obsolete methods it is
-    // possible that we might have updated the method_code_map by making this method obsolete in a
-    // previous frame. Therefore we should just check that the non-obsolete version of this method
-    // is the one we expect. We change to the non-obsolete versions in the error message since the
-    // obsolete version of the method might not be fully initialized yet. This situation can only
-    // occur when we are in the process of allocating and setting up obsolete methods. Otherwise
-    // method and it->second should be identical. (See openjdkjvmti/ti_redefine.cc for more
-    // information.)
-    DCHECK_EQ(found_method->GetNonObsoleteMethod(), method->GetNonObsoleteMethod())
-        << ArtMethod::PrettyMethod(method->GetNonObsoleteMethod()) << " "
-        << ArtMethod::PrettyMethod(found_method->GetNonObsoleteMethod()) << " "
+    DCHECK_EQ(found_method, method)
+        << ArtMethod::PrettyMethod(method) << " "
+        << ArtMethod::PrettyMethod(found_method) << " "
         << std::hex << pc;
   }
   return method_header;
@@ -2040,16 +2012,16 @@ bool JitCodeCache::IsOsrCompiled(ArtMethod* method) {
   return osr_code_map_.find(method) != osr_code_map_.end();
 }
 
-bool JitCodeCache::NotifyCompilationOf(ArtMethod* method, Thread* self, bool osr) {
+bool JitCodeCache::NotifyCompilationOf(ArtMethod* method, Thread* self, bool osr, bool prejit) {
   if (!osr && ContainsPc(method->GetEntryPointFromQuickCompiledCode())) {
     return false;
   }
 
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   if (class_linker->IsQuickResolutionStub(method->GetEntryPointFromQuickCompiledCode())) {
-    if (!Runtime::Current()->IsUsingApexBootImageLocation() || !Runtime::Current()->IsZygote()) {
-      // Unless we're running as zygote in the jitzygote experiment, we currently don't save
-      // the JIT compiled code if we cannot update the entrypoint due to having the resolution stub.
+    if (!prejit) {
+      // Unless we're pre-jitting, we currently don't save the JIT compiled code if we cannot
+      // update the entrypoint due to having the resolution stub.
       VLOG(jit) << "Not compiling "
                 << method->PrettyMethod()
                 << " because it has the resolution stub";
@@ -2101,18 +2073,20 @@ bool JitCodeCache::NotifyCompilationOf(ArtMethod* method, Thread* self, bool osr
   } else {
     ProfilingInfo* info = method->GetProfilingInfo(kRuntimePointerSize);
     if (info == nullptr) {
-      VLOG(jit) << method->PrettyMethod() << " needs a ProfilingInfo to be compiled";
-      // Because the counter is not atomic, there are some rare cases where we may not hit the
-      // threshold for creating the ProfilingInfo. Reset the counter now to "correct" this.
-      ClearMethodCounter(method, /*was_warm=*/ false);
-      return false;
+      // When prejitting, we don't allocate a profiling info.
+      if (!prejit) {
+        VLOG(jit) << method->PrettyMethod() << " needs a ProfilingInfo to be compiled";
+        // Because the counter is not atomic, there are some rare cases where we may not hit the
+        // threshold for creating the ProfilingInfo. Reset the counter now to "correct" this.
+        ClearMethodCounter(method, /*was_warm=*/ false);
+        return false;
+      }
+    } else {
+      if (info->IsMethodBeingCompiled(osr)) {
+        return false;
+      }
+      info->SetIsMethodBeingCompiled(true, osr);
     }
-
-    if (info->IsMethodBeingCompiled(osr)) {
-      return false;
-    }
-
-    info->SetIsMethodBeingCompiled(true, osr);
     return true;
   }
 }
@@ -2150,8 +2124,10 @@ void JitCodeCache::DoneCompiling(ArtMethod* method, Thread* self, bool osr) {
     }  // else CommitCodeInternal() updated entrypoints of all methods in the JniStubData.
   } else {
     ProfilingInfo* info = method->GetProfilingInfo(kRuntimePointerSize);
-    DCHECK(info->IsMethodBeingCompiled(osr));
-    info->SetIsMethodBeingCompiled(false, osr);
+    if (info != nullptr) {
+      DCHECK(info->IsMethodBeingCompiled(osr));
+      info->SetIsMethodBeingCompiled(false, osr);
+    }
   }
 }
 
