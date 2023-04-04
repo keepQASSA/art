@@ -27,20 +27,24 @@
 namespace art {
 
 inline bool ATraceEnabled() {
+  int enabled = 0;
+  if (UNLIKELY(PaletteTraceEnabled(&enabled) == PaletteStatus::kOkay && enabled != 0)) {
+    return true;
+  } else {
     return false;
+  }
 }
 
 inline void ATraceBegin(const char* name) {
-    (void)name;
+  PaletteTraceBegin(name);
 }
 
 inline void ATraceEnd() {
-
+  PaletteTraceEnd();
 }
 
 inline void ATraceIntegerValue(const char* name, int32_t value) {
-  (void)name;
-  (void)value;
+  PaletteTraceIntegerValue(name, value);
 }
 
 class ScopedTrace {
